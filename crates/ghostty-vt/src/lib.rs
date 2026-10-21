@@ -845,6 +845,11 @@ pub struct LinkRegion {
     pub end_col: u16,
 }
 
+pub struct TextLink {
+    pub uri: String,
+    pub regions: Vec<LinkRegion>,
+}
+
 pub struct Terminal {
     raw: ffi::GhosttyTerminal,
     max_scrollback: usize,
@@ -1458,6 +1463,16 @@ impl Terminal {
         let Some(range) = resolve(&text, clicked_byte) else {
             return Ok(Vec::new());
         };
+        self.link_regions_for_selection(selection, range)
+    }
+
+    fn link_regions_for_selection(
+        &self,
+        selection: ffi::GhosttySelection,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<LinkRegion>, Error> {
+        let cols = self.cols()?;
+        let rows = self.rows()?;
         let point =
             |grid_ref: &ffi::GhosttyGridRef, clipped: (u16, u32)| -> Result<(u16, u32), Error> {
                 let mut out = ffi::GhosttyPointCoordinate::default();
@@ -1545,6 +1560,150 @@ impl Terminal {
             }
         }
         Ok(regions)
+    }
+
+    /// Native targets for plain-text URLs across actual terminal wraps.
+    /// The resolver supplies URL policy; terminal selection supplies wrap boundaries.
+    pub fn viewport_text_links(
+        &self,
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Result<Vec<TextLink>, Error> {
+        let cols = self.cols()?;
+        let rows = self.rows()?;
+        let mut links = Vec::new();
+        let mut prefix = [0u8; 8];
+        let mut prefix_len = 0;
+        let mut start = (0, 0);
+        let mut skip_token = false;
+        for y in 0..u32::from(rows) {
+            let mut cell = self.grid_ref(ghostty_viewport_point(0, y))?;
+            let (_, continuation) = grid_ref_wrap_state(&cell)?;
+            if !continuation {
+                prefix_len = 0;
+                skip_token = false;
+            }
+            for x in 0..cols {
+                cell.x = x;
+                let mut raw = ffi::GhosttyCell::default();
+                let mut codepoint = 0u32;
+                let mut wide = ffi::GhosttyCellWide_GHOSTTY_CELL_WIDE_NARROW;
+                let keys = [
+                    ffi::GhosttyCellData_GHOSTTY_CELL_DATA_CODEPOINT,
+                    ffi::GhosttyCellData_GHOSTTY_CELL_DATA_WIDE,
+                ];
+                let mut values = [
+                    (&mut codepoint as *mut u32).cast::<c_void>(),
+                    (&mut wide as *mut ffi::GhosttyCellWide).cast::<c_void>(),
+                ];
+                let mut written = 0;
+                // SAFETY: output types match the requested cell fields.
+                unsafe {
+                    ffi::ghostty_grid_ref_cell(&cell, &mut raw).into_result()?;
+                    ffi::ghostty_cell_get_multi(
+                        raw,
+                        keys.len(),
+                        keys.as_ptr(),
+                        values.as_mut_ptr(),
+                        &mut written,
+                    )
+                    .into_result()?;
+                }
+                if matches!(
+                    CellWide::from_raw(wide),
+                    CellWide::SpacerHead | CellWide::SpacerTail
+                ) {
+                    continue;
+                }
+                let ch = char::from_u32(codepoint).unwrap_or(' ');
+                if codepoint == 0 || ch.is_whitespace() {
+                    prefix_len = 0;
+                    skip_token = false;
+                    continue;
+                }
+                if skip_token {
+                    continue;
+                }
+                let boundary = y == 0 && x == 0 && continuation;
+                if prefix_len > 0 {
+                    prefix[prefix_len] = u8::try_from(codepoint).unwrap_or(0);
+                    prefix_len += 1;
+                    if !b"http://".starts_with(&prefix[..prefix_len])
+                        && !b"https://".starts_with(&prefix[..prefix_len])
+                    {
+                        prefix_len = 0;
+                    }
+                }
+                if prefix_len == 0 && ch == 'h' {
+                    prefix[0] = b'h';
+                    prefix_len = 1;
+                    start = (x, y);
+                }
+                let clipped_scheme = y + 1 == u32::from(rows) && x + 1 == cols && prefix_len > 0;
+                if !boundary
+                    && !clipped_scheme
+                    && &prefix[..prefix_len] != b"http://"
+                    && &prefix[..prefix_len] != b"https://"
+                {
+                    continue;
+                }
+                let (x, y) = if boundary { (x, y) } else { start };
+                skip_token = !boundary;
+                prefix_len = 0;
+                let (text, clicked_byte, selection) = match self.viewport_link_selection(x, y)? {
+                    Some((LinkTarget::Text { text, clicked_byte }, Some(selection))) => {
+                        (text, clicked_byte, selection)
+                    }
+                    Some(_) => {
+                        skip_token = false;
+                        continue;
+                    }
+                    None => continue,
+                };
+                let Some(range) = resolve(&text, clicked_byte) else {
+                    skip_token = false;
+                    continue;
+                };
+                let Some(uri) = text.get(range.clone()) else {
+                    continue;
+                };
+                skip_token = true;
+                let uri = uri.to_owned();
+                let regions = self.link_regions_for_selection(selection, range)?;
+                links.push(TextLink { uri, regions });
+            }
+        }
+        Ok(links)
+    }
+
+    /// Check tokens whose offscreen content can change without dirty visible rows.
+    pub fn viewport_boundary_text_link(
+        &self,
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Result<bool, Error> {
+        let cols = self.cols()?;
+        let rows = self.rows()?;
+        if cols == 0 || rows == 0 {
+            return Ok(false);
+        }
+        for (x, y, top) in [(0, 0, true), (cols - 1, u32::from(rows - 1), false)] {
+            let cell = self.grid_ref(ghostty_viewport_point(x, y))?;
+            let (wrapped, continuation) = grid_ref_wrap_state(&cell)?;
+            if (top && continuation) || (!top && wrapped) {
+                let x = if !top && grid_ref_wide(&cell)? == CellWide::SpacerHead {
+                    x.saturating_sub(1)
+                } else {
+                    x
+                };
+                if let Some(LinkTarget::Text { text, clicked_byte }) =
+                    self.viewport_link_target(x, y)?
+                {
+                    if resolve(&text, clicked_byte).is_some() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn grid_ref(&self, point: ffi::GhosttyPoint) -> Result<ffi::GhosttyGridRef, Error> {
@@ -3325,7 +3484,6 @@ impl<'a> RowIter<'a> {
         Ok(dirty)
     }
 
-    #[cfg(windows)]
     pub fn wrap_state(&self) -> Result<(bool, bool), Error> {
         let mut row = 0;
         // SAFETY: row output matches requested row data type.
